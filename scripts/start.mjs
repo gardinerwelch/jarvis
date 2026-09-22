@@ -44,6 +44,10 @@ function vendorWasm() {
   }
 }
 
+// Kokoro's WebGPU backend has the same CDN problem and does not need the same
+// fix, because nothing has to be copied: Vite can address the one file it needs
+// where it already sits in node_modules. See the comment in src/lib/kokoro.ts.
+
 const writes = process.argv.includes('--writes')
 
 // A dim label per process, so the interleaved logs stay readable.

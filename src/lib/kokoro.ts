@@ -10,12 +10,28 @@
  * no API key, nothing leaves the machine — but it sounds like a person. It
  * carries four British male voices, which is what this project actually wants.
  *
- * The cost is a one-time ~86MB model download, cached by the browser
- * afterwards. It's fetched during the boot sequence so the first "Hey Jarvis"
+ * The cost is a one-time model download — 310MB on WebGPU, 88MB without it,
+ * for the reasons in load() — cached by the browser afterwards. It's fetched
+ * during the boot sequence so the first "Hey Jarvis"
  * isn't waiting on it, and anything that goes wrong falls back to Daniel.
  */
 
 import { KOKORO_VOICE } from '../config'
+
+/**
+ * The 21MB WebAssembly build of the ONNX runtime, addressed rather than bundled.
+ *
+ * `?url` hands back a URL on our own origin instead of inlining the file: in dev
+ * it points straight at node_modules, and in a production build Vite copies the
+ * binary into dist/ and returns its hashed name. Either way the runtime is told
+ * exactly where its binary is, so it never has to work it out — which is the
+ * whole problem, below.
+ *
+ * Reached by path rather than by package name because onnxruntime-web's manifest
+ * lists only its JavaScript entry points; asking for one of its `.wasm` files by
+ * name is refused before Vite ever sees the file.
+ */
+import ortWasmUrl from '../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.wasm?url'
 
 type Kokoro = {
   generate: (
@@ -76,15 +92,57 @@ export async function load(): Promise<Kokoro | null> {
 
   loading = (async () => {
     try {
-      const { KokoroTTS } = await import('kokoro-js')
+      const { KokoroTTS, env } = await import('kokoro-js')
+      // Transformers.js sets onnxruntime-web's `wasmPaths` to a cdn.jsdelivr.net
+      // URL at import time. The page's CSP names no CDN in `script-src`
+      // (deliberately — same reasoning as vendoring MediaPipe's WASM in
+      // scripts/start.mjs: a CDN import is a live, unpinned supply-chain
+      // dependency), so the runtime's attempt to import its WebGPU backend from
+      // there is blocked and Kokoro drops to the system voice.
+      //
+      // The shape of this override is load-bearing, and the obvious fix is the
+      // wrong one. `wasmPaths` takes either a directory prefix (a string) or a
+      // map naming the two files individually. onnxruntime-web's default browser
+      // build already carries the loader script inline, but it only uses that
+      // copy when it has been given neither a prefix nor an explicit loader path
+      // — a prefix pushes it back onto fetching the loader as a module, and Vite
+      // refuses to serve a module it did not process, wherever the file is put.
+      // Naming only the binary keeps the inline loader and settles the one thing
+      // that genuinely needs settling.
+      //
+      // `env.wasmPaths` here is kokoro-js's one-property passthrough to
+      // transformers' `env.backends.onnx.wasm.wasmPaths` — the nested path isn't
+      // reachable through this import.
+      env.wasmPaths = { wasm: ortWasmUrl }
+
+      // The weights have to match the backend, and getting this pairing wrong
+      // does not fail — it just speaks badly.
+      //
+      // int8 weights have no native WebGPU path in onnxruntime-web, so a q8
+      // model on that backend runs through a partial, lossy emulation. It
+      // produces audio, which is why this looked fine for a while, but the
+      // waveform is wrong: measured against the same model on the CPU backend,
+      // q8-on-WebGPU came back 50ms short on an identical sentence (the
+      // duration predictor itself had diverged) and carried 29% less
+      // high-frequency energy. That is the muffled, mouth-full sound. It was
+      // also, absurdly, the slowest configuration of the three — the emulation
+      // costs more than it saves.
+      //
+      // fp32 on WebGPU reproduces the CPU reference exactly: same sample count
+      // to the sample, same spectral balance, and roughly eleven times faster
+      // than the q8 path it replaces. kokoro-js's own README says as much —
+      // "if using webgpu, we recommend using dtype=fp32".
+      //
+      // The cost is the download: 310MB against q8's 88MB, once, then cached.
+      // Without WebGPU there is nothing to pair fp32 with, so that case takes
+      // the small weights on the CPU backend, which is the combination those
+      // weights were quantised for.
+      const webgpu = typeof navigator !== 'undefined' && 'gpu' in navigator
       const tts = await KokoroTTS.from_pretrained(
         'onnx-community/Kokoro-82M-v1.0-ONNX',
         {
-          // q8 is about 86MB against fp32's 330MB, and the difference is
-          // inaudible through laptop speakers. WebGPU keeps generation ahead
-          // of playback; without it this would be too slow to converse with.
-          dtype: 'q8',
-          device: 'webgpu',
+          dtype: webgpu ? 'fp32' : 'q8',
+          device: webgpu ? 'webgpu' : 'wasm',
           // The callback is a union across several event shapes; only the
           // download-progress one carries a percentage.
           progress_callback: (p: unknown) => {
