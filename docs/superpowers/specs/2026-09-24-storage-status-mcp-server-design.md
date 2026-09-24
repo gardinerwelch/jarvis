@@ -1,21 +1,21 @@
 # Storage Status MCP Server — Design
 
-**Status:** DRAFT — pending fresh-eyes review + Gardiner's approval
+**Status:** DRAFT r2 — fresh-eyes review (2026-09-24, 19 findings) ruled and folded in; pending Gardiner's approval
 **Date:** 2026-09-24
 **Repo this builds in:** `file-management` (not `jarvis`). This doc lives in `jarvis` alongside the receipts-status spec because it records the second instance of the JARVIS MCP-server-per-repo pattern; the code lives next to the data it reads.
 **Predecessor:** `2026-09-22-receipts-status-mcp-server-design.md` (same pattern, first instance)
 
 ## Problem
 
-JARVIS can answer "how are my receipts?" but not "how's my storage?" The answer to that second question is spread across file-management: volume capacity, backup mirrors, migration lanes, running/stalled operations and drive health. Gardiner wants all four areas, spoken as a short headline and shown as a HUD panel with the status of each.
+JARVIS can answer "how are my receipts?" but not "how's my storage?" The answer is spread across file-management: volume capacity, backup mirrors, migration lanes, running/failed operations and drive health. Gardiner wants all four areas: a short spoken headline plus a HUD panel showing the status of each.
 
 ## Why not just read status.json
 
-The receipts-status pattern reads a status file the pipeline already writes. file-management has one too (`status.json`, written by `summarize.py`), but it is currently **12 days stale** (`generated: 2026-09-12`): the job that would refresh it every 5 minutes, `com.gabba.fleet-sweep.plist`, was deliberately left unloaded. `docs/specs/2026-08-12-digitize-station-independence-inventory.md` records why: if the laptop and the Mini both run it, they regenerate `status.json` on independent timers ("churn hazard"), and which machine is the hub is parked until the new Mac Mini arrives.
+file-management already writes `status.json` (via `summarize.py`), but it is **12 days stale** (`generated: 2026-09-12`). The job that would refresh it every 5 minutes, `com.gabba.fleet-sweep.plist`, was deliberately left unloaded: `docs/specs/2026-08-12-digitize-station-independence-inventory.md` (~line 154) records that laptop + Mini both running it would regenerate `status.json` on independent timers, and which machine is the hub is parked until the new Mac Mini arrives.
 
 Running `summarize.py` from the tool is also ruled out: `main()` calls `ops_sweep()` first, which appends to `ops-log.jsonl`, deletes/quarantines heartbeat files and relays files between ops zones. A tool the bridge auto-approves as read-only must not do any of that.
 
-**Decision:** the server builds a **live snapshot in memory** on every call from `summarize.py`'s and `ledger.py`'s read-only functions. It never calls `summarize.main()` or `ops_sweep()`, never writes `status.json`/`STATUS.md`, never writes anything. The hub/sweep question stays parked.
+**Decision:** the server builds a **live snapshot in memory** on every call from `summarize.py`'s and `ledger.py`'s read-only functions, plus `os.statvfs`. It never calls `summarize.main()` or `ops_sweep()`, and writes nothing. The two sweep rules that *resolve* stale alarms (supersession, abandonment) are re-applied in memory at read time — see Ops — so the laptop doesn't announce permanently-unresolvable alarms. The hub/sweep question stays parked.
 
 ## Architecture
 
@@ -23,101 +23,116 @@ New directory `file-management/mcp-server/`, same layout as `2nd-brain/mcp-serve
 
 | File | Responsibility |
 |---|---|
-| `snapshot.py` | Collects raw data by calling existing read functions (table below). Each collector runs in its own daemon thread with a timeout; a failure or timeout marks only that source unavailable. Returns a plain dict. No MCP import. |
-| `summary.py` | Pure: `build_summary(snapshot: dict, now: datetime) -> dict` producing `{headline, generated_at, ok, sections}`. No I/O, no MCP import. Holds the thresholds as module constants. |
-| `storage_status_server.py` | Thin MCP wrapper, stdio transport, one tool: `get_storage_status()`, no arguments. Calls `snapshot.collect()` then `summary.build_summary()`. Catches everything; never raises to the client. |
-| `requirements.txt` | `mcp>=1.0.0,<2` (unpinned installs pull a breaking 2.x API — same pin as 2nd-brain). |
-| `.venv/` | Dedicated virtualenv, gitignored. `~/.claude.json`'s `command` points at its absolute `bin/python3`. |
+| `snapshot.py` | Collects raw data (table below). Each collector runs in its own daemon thread under one shared deadline; a failure or timeout marks only that source unavailable. Returns a plain dict. No MCP import. |
+| `summary.py` | Pure: `build_summary(snapshot: dict, now: datetime) -> dict` → `{ok, headline, generated_at, sections}`. No I/O, no MCP import. Holds thresholds and `EXPECTED_MOUNTS` as module constants. |
+| `storage_status_server.py` | Thin FastMCP wrapper, stdio transport, one tool: `async def get_storage_status()`, no arguments. Imports `snapshot`/`summary` **lazily inside the tool** under `try`, runs `collect()` via `await anyio.to_thread.run_sync(...)` (FastMCP runs sync tools on the event loop, which would block pings for the ~5 s worst case), and wraps the collection in `contextlib.redirect_stdout(sys.stderr)` — stdout is the JSON-RPC transport, and several file-management helpers `print()` (don't reassign `sys.stdout` globally; the stdio transport captures it at startup). Never raises to the client. |
+| `requirements.txt` | `mcp>=1.0.0,<2` (unpinned installs pull a breaking 2.x API — same pin as 2nd-brain; 1.30.0 on Python 3.14 matches the 2nd-brain venv). |
+| `.venv/` | Dedicated virtualenv, gitignored. `~/.claude.json`'s `command` points at its absolute `bin/python3`; `env` sets `PYTHONDONTWRITEBYTECODE=1`. |
 
-**Tool name:** `get_storage_status` — must start with a `READ_VERB` in `jarvis/bridge/server.mjs`'s `decideTool()`, or the bridge silently denies it (lesson from receipts-status, 2026-09-24).
+**Tool name:** `get_storage_status` — passes `jarvis/bridge/server.mjs`'s `decideTool()` (`READ_VERB` `^get`, no `EFFECTFUL_VERB` hit). A noun-only name is silently denied (receipts-status lesson, 2026-09-24).
+**Server key in `~/.claude.json`:** `storage-status`. Must not contain `__` (`mcpServerOf` splits tool names on it, `server.mjs:~365`). The bridge reads `~/.claude.json` once at start, so registration requires a bridge restart.
 
-**Import path:** file-management's modules are top-level scripts in the repo root (no package). `snapshot.py` does `sys.path.insert(0, str(Path(__file__).resolve().parent.parent))` before `import ledger, summarize`. Importing `summarize` has only path-constructing side effects at module level (`NAS_OPS_ZONE`, `LOCAL_OPS_FALLBACK`, `OPS_LOG_PATH` are `Path` objects; `ops_heartbeat._default_nas_zone()` just builds `/Volumes/_Inbox/_fleet-drops/_ops`). The review must confirm the transitive imports (`ops_heartbeat`, `rsync_parse`, `station_scan`, `tree_index` → `hash_index`) have no import-time writes.
+**Import path and bytecode:** file-management's modules are top-level scripts (no package). `snapshot.py` sets `sys.dont_write_bytecode = True`, then `sys.path.insert(0, str(Path(__file__).resolve().parent.parent))`, then `import ledger, summarize`. Import chain verified side-effect-free by review (`summarize` → `ledger`, `ops_heartbeat`, `rsync_parse`, `station_scan`, `tree_index` → `hash_index`: constant/Path construction only; no sqlite open, no signal handlers).
 
 ### Collectors (snapshot.py)
 
-| Source key | Call | Live? | Can hang? |
+| Source key | How | Freshness | Can hang? |
 |---|---|---|---|
-| `volumes` | `summarize.volume_fullness()` (`df -H`) | live | yes — `df` blocks on a dropped SMB mount |
-| `ledger_rows` | `ledger.read_rows(ledger.LEDGER)` → `summarize.lane_summary()` | live (local file) | no |
+| `volumes` | `os.statvfs(p)` for each `p` in `Path("/Volumes").iterdir()` (skip non-dirs / non-mount-points via `os.path.ismount`). **Not** `summarize.volume_fullness()`: its `df -H` + `line.split()` parse loses any mount with a space in its name (`/Volumes/Apple Media-Syno` → `mount: "Media-Syno"`), and an abandoned `df` child lingers per call on a hung mount. | live | yes — statvfs on a dropped SMB mount |
+| `ledger_rows` | `ledger.read_rows(ledger.LEDGER)` → `summarize.lane_summary()` + per-lane raw status counts | live (local) | no |
 | `mirrors` | `ledger.read_rows(ledger.MIRRORS)` | hand-maintained CSV | no |
 | `drives` | `ledger.read_rows(ledger.DRIVES)` | updated at check-in | no |
-| `active_ops` | `summarize.active_operations([summarize.NAS_OPS_ZONE, summarize.LOCAL_OPS_FALLBACK])` (legacy=True default, same call `fleet_panel.py` makes) | live | yes — globs `/Volumes/_Inbox/…` over SMB |
-| `recent_ops` | `summarize.recent_operations(summarize.OPS_LOG_PATH)` | only as fresh as the last sweep | no (local file) |
+| `active_ops` | `summarize.active_operations([summarize.NAS_OPS_ZONE, summarize.LOCAL_OPS_FALLBACK])` (legacy=True, same call as `fleet_panel.py:~225`) | live | yes — globs `/Volumes/_Inbox/_fleet-drops/…` over SMB |
+| `recent_ops` | `summarize.recent_operations(summarize.OPS_LOG_PATH, n=5)` — window of 5 **plus every pinned unresolved failure** (never slice the result) | as of last sweep (ops-log mtime; 2026-09-11 today) | no |
 
-Each collector records `{value, ok, error, as_of}`. `as_of` is the call time for live sources and the source file's mtime for `mirrors`, `drives` and `recent_ops` (`ops-log.jsonl`).
+Each collector records `{value, ok, error, as_of}`. `as_of` = call time for live sources; source file mtime for `mirrors`, `drives`, `recent_ops`.
 
-**Timeouts:** each collector runs in a `threading.Thread(daemon=True)`; the collector waits `join(timeout=5)`. A thread still alive after that is abandoned (daemon, so it can't keep the process alive) and the source is marked `ok: false, error: "timed out"`. Collectors run concurrently so the worst case for the whole call is ~5 s, not 5 s × 6. No `ThreadPoolExecutor` (its shutdown waits on hung workers). `summarize.volume_fullness()` itself is **not** modified — no upstream change.
+**Timeouts:** start all collector threads (`threading.Thread(daemon=True)`), set `deadline = time.monotonic() + 5`, then `t.join(max(0, deadline - time.monotonic()))` for each — one shared 5 s budget, not 5 s per collector. A thread still alive at the deadline is abandoned (daemon; no locks or shared mutable state in any collector — verified) and its source is `ok: false, error: "timed out"`. No `ThreadPoolExecutor` (its shutdown waits on hung workers). No upstream change to file-management's existing modules.
+
+**CSV failure granularity:** `ledger.read_rows` raises `ValueError` for the whole file on one malformed row (`ledger.py:31-50`). That makes the dependent section/sub-list `unavailable` with the error text — same posture as `fleet_panel.py:213-216`. Note `_legacy_operations` also reads `drives.csv`, so a corrupt `drives.csv` degrades both `drives` and `active_ops`.
 
 ## Output shape
 
 ```
 {
   "ok": bool,                 # false only when every section is unavailable
-  "headline": str,            # spoken; ≤ 3 clauses; no paths, IDs or raw numbers beyond percentages
+  "headline": str,            # spoken; ≤ 3 clauses; no paths, IDs or slugs
   "generated_at": iso str,
   "sections": {
-    "capacity": { status, as_of, source: "live",   items: [{mount, used, capacity, pct, level}] },
-    "backups":  { status, as_of, source: "manual", items: [{dest, target, method, last_verified, age_days, level}] },
-    "lanes":    { status, as_of, source: "live",   items: [{lane, done, total, bytes_done, bytes_planned, complete}] },
-    "ops":      { status, as_of, source: "live",   active: [...], recent: [...], recent_as_of, drive_warnings: [...] }
+    "capacity": { status, as_of, source: "live",   reason?, items: [{mount, name, used_bytes, size_bytes, pct, level}], missing: [name] },
+    "backups":  { status, as_of, source: "manual", reason?, items: [{dest, target, method, last_verified, age_days, level}] },
+    "lanes":    { status, as_of, source: "live",   reason?, items: [{lane, done, total, bytes_done, bytes_planned, open}] },
+    "ops":      { status, as_of, source: "live",   reason?, failed: [...], abandoned: [...], stalled: [...], running: [...], recent: [...], recent_as_of, drive_warnings: [...] }
   }
 }
 ```
 
-`status` per section ∈ `ok | warn | critical | unavailable`. `unavailable` sections carry `reason` (plain English) and no items.
+`status` per section ∈ `ok | warn | critical | unavailable`. Any section may carry an optional `reason` (plain English); `unavailable` always does.
 
 ### Section rules
 
-- **capacity** — keep only mounts starting with `/Volumes/` (summarize's own filter is a substring match, so it also admits `/System/Volumes/*`, which must be dropped). `pct` parsed from `use_pct` (`"90%"` → 90). `level`: `critical` ≥ 95, `warn` ≥ 85, else `ok`. Section status = worst item level.
-- **backups** — from `mirrors.csv` (`dest, mirror_target, method, last_verified_sync, status`). `age_days` = today − `last_verified_sync`. `level`: `warn` when `age_days` > 30, or when `status` ≠ `active`, or the date is unparseable. `source: "manual"`: this date is a hand-recorded verification, not live Hyper Backup/Snapshot Replication telemetry; JARVIS must phrase it as "last checked", never "last synced". Empty CSV → section status `ok` with a `reason: "no mirrors configured"`.
-- **lanes** — from `lane_summary()`. `done` = `by_status.verified + by_status.cleared` (same definition as `STATUS.md`). `complete` = `done == total`. Section status `warn` if any lane is incomplete, else `ok`. (Open lanes are expected work, not a fault, so never `critical`.)
-- **ops** —
-  - `active`: entries from `active_operations()` with `state == "running"` (the terminal set is `complete | failed | paused`, `ops_heartbeat._TERMINAL_STATES`; `summarize._op_rank` uses the same `!= "running"` test). An entry with `stale: true` is **stalled** → `warn`. This includes `summarize._synthetic_unparseable_entry` (state `running`, `stale: True`, label "unreadable heartbeat — inspect") — intended: an unreadable heartbeat is meant to be a visible alarm.
-  - `failed_unswept`: entries from `active_operations()` with `state == "failed"`. Because the sweep isn't running on this laptop (see "Why not just read status.json"), a failed op's terminal heartbeat can sit in the ops zone without ever reaching `ops-log.jsonl`, so `recent_operations()` alone would miss it. These count as unresolved failures → `critical`. Terminal `complete`/`paused` heartbeats awaiting a sweep are ignored.
-  - `recent`: first 5 from `recent_operations()`; any `is_unresolved_failure(e)` → `critical`. `recent_as_of` = ops-log mtime, so the panel can show that recent ops are only as fresh as the last sweep.
-  - `drive_warnings`: rows in `drives.csv` whose `health` is non-empty and not `ok` (today: the LaCie `warn`), with `label` and the first sentence of `notes`.
+- **capacity** — every mounted `/Volumes/*`; `pct = round(100 * (1 - f_bavail / f_blocks))` (what Finder/df report as used%). `level`: `critical` ≥ 95, `warn` ≥ 85, else `ok`. `EXPECTED_MOUNTS = ["Projects-Syno", "_Inbox"]` (the NAS share and the fleet drop-zone share): any not mounted → listed in `missing`, section at least `warn`. Section status = worst of items and missing.
+- **backups** — from `mirrors.csv` (`dest, mirror_target, method, last_verified_sync, status`). `age_days` = today − `last_verified_sync`. `level`: `warn` when `age_days` > 30, `status` ≠ `active`, or the date is unparseable. `source: "manual"` — a hand-recorded verification, not live Hyper Backup/Snapshot Replication telemetry; spoken as "last checked", never "last synced". Empty CSV → `ok`, `reason: "no mirrors configured"`.
+- **lanes** — from `lane_summary()` plus raw status counts. `done` = `verified + cleared` (same definition as `STATUS.md`); `bytes_done` = `lane_summary`'s `bytes_verified`. **`open` = the lane still has any `planned` row.** Lanes whose work finished in states that never reach `verified` (`executed`, `reviewed-no-action` — e.g. `small-folders-triage`, `kids-corner-cull`) are not open. Section `warn` if any lane is open, else `ok`; never `critical` (open lanes are expected work).
+- **ops** — from `active_ops` (heartbeats) + `recent_ops` (log), with the sweep's resolution rules applied **in memory only**:
+  Candidate pool for both rules = `active_ops` entries + `recent_ops` entries (the in-memory analogue of the sweep's `merged_log` + valid heartbeats). Mirror `ops_sweep` exactly (`summarize.py:~841-900`), without any of its writes:
+  - `failed` (sweep step 5): only `state == "failed"` entries are reported (the sweep also resolves `paused`, but paused is a first-class terminal state, not a failure, per `recent_operations`' docstring). A failed entry is **superseded** — hence dropped — when any *other* pool entry satisfies `summarize._same_run_family(entry, other)` and has a later `finished_at or logged_at` than the entry's (any terminal state, as the sweep does; a newer failure supersedes an older one). Entries already `summarize.is_resolved()` are dropped. What remains → `critical`.
+  - `abandoned` (sweep step 6): `state == "running"` entries (excluding the synthetic unreadable-heartbeat entry, which the sweep treats in step 7, not 6) where `last_beat` is unparseable/missing, **or** older than `summarize.ABANDON_S` (24 h), **or** `summarize._find_newer_match(entry, pool, entry["op_id"])` returns a newer same-family run. → `warn`. Spoken "an old operation never finished cleanly", never "stalled".
+  - `stalled`: `state == "running"`, `stale: True`, not abandoned — including the synthetic unreadable-heartbeat entry (`running`, `stale: True`, label "unreadable heartbeat — inspect"), the repo's designed visible alarm. → `warn`.
+  - `running`: `state == "running"`, not stale. Informational.
+  - Terminal `complete` / `paused` heartbeats awaiting a sweep are ignored (terminal set = `ops_heartbeat._TERMINAL_STATES`).
+  - `recent`: `recent_ops` as returned (5 + pins). `recent_as_of` = ops-log mtime; the panel always shows it dimmed (it's weeks old until a sweep runs — intended, so it's never mistaken for live).
+  - `drive_warnings`: `drives.csv` rows with non-empty `health` other than `ok`: `{label, health, note}` where `note` = `notes` up to the first `;`, ` -- ` or `.`.
   - Section status = worst of the above.
 
 ### Headline
 
-Built worst-first from at most three items, in this priority:
+Up to three clauses, worst-first, with **the last slot reserved** for a missing-mount / unavailable-section clause whenever one exists (so an unreachable NAS is always spoken). Priority and wording:
 
-1. Critical capacity ("Projects-Syno is at 96 percent.")
-2. Unresolved failed operation
-3. Stalled active operation
-4. Drive health warning ("The LaCie has a health warning.")
-5. Overdue backup check ("Backup checks are 50 days old.")
-6. Warn-level capacity
-7. Open lanes ("Three migration lanes are still open.")
+1. Critical capacity — "Projects-Syno is at 96 percent."
+2. Missing expected mount — "Projects-Syno isn't mounted." (reserved slot)
+3. Failed operation — by `op_type` + count + relative day, never `subject_label` (new-style labels are slugged paths): "Two presort runs failed, most recently on the 20th."
+4. Abandoned operation — "An old presort run never finished cleanly." (count if > 1)
+5. Stalled operation — "A running operation has stopped reporting."
+6. Drive health warning — "The LaCie has a health warning." (count if > 1)
+7. Overdue backup check — uses the **max** `age_days`: "Backup checks are 50 days old." Non-`active` or unparseable mirror → "A backup mirror needs checking."
+8. Warn-level capacity — "Projects-Syno is at 90 percent."
+9. Open lanes — "Two migration lanes are still open."
+10. Unavailable section (reserved slot) — "Couldn't read live operations." / "Couldn't read disk capacity."
 
-Unavailable sections add one clause at the end only if there's room ("Couldn't reach the NAS for live operations."). All `ok` → "Storage is healthy." All unavailable → `ok: false`, headline "I couldn't read any storage status right now."
+All `ok` → "Storage is healthy." All sections unavailable → `ok: false`, "I couldn't read any storage status right now."
 
-**Expected output against today's real data:** capacity warn (Projects-Syno 90%); backups warn (all three mirrors last verified 2026-08-05, 50 days); lanes warn (letter-normalize, PRESORT_Projects, small-folders-triage open); drive warning (LaCie). Headline: "The LaCie has a health warning. Backup checks are 50 days old. Projects-Syno is at 90 percent."
+**Expected output against today's live data** (per review of the live ops zone and `ledger.csv`, 2026-09-24 — the build's first task re-runs `collect()` read-only and records the actual result here before tests are written): ops `critical` if any of the 3 `failed` presort heartbeats (09-17 ×2, 09-20) is not superseded by a completed retry — the review found two retried minutes later, so expect one remaining failure; 5 `running` `presort_plan` heartbeats 6–12 days old → abandoned; LaCie drive warning; backups 50 days; Projects-Syno 90%; two open lanes (letter-normalize, PRESORT_Projects). Likely headline: "A presort run failed on the 20th. Five old presort runs never finished cleanly. The LaCie has a health warning."
 
 ### Panel
 
-No new UI code. JARVIS's in-process `display` tool (`jarvis/bridge/panels.mjs`) already lets the model author a panel from a fixed class set. The tool description tells the model the result is built to be displayed: one block per section, `.hud-bar` (`--v`) per volume and per lane, tagged `.hud-row`s for backups and ops, `.hud-tag` carrying the level, `.hud-dim` "as of" line on any section whose `as_of` is over a day old. The spoken reply is the `headline`; the panel carries the detail.
+No new UI code. JARVIS's in-process `display` tool (`jarvis/bridge/panels.mjs`) lets the model author a panel from a fixed class set, and its own rule caps a panel at roughly 6 rows / 40 words (`panels.mjs:~93`). So the tool description specifies a **compact panel**: one `.hud-row` per section (capacity, backups, lanes, ops) with the section name as `.hud-label`, the level as `.hud-tag` (`.hud-hot` when warn/critical), and one `.hud-sub` line with the single worst detail; a `.hud-dim` "as of" note on any section older than a day. The full breakdown (a `.hud-bar` per volume and per lane, a row per mirror/op) goes in a blade (`kind: markup`, `panels.mjs:~239`) **only when Gardiner asks for detail**. The spoken reply is the `headline`.
 
 ## Error handling
 
-- Every collector failure or timeout → that section `unavailable` with a plain reason; other sections unaffected. A section depending on two sources (ops: `active_ops` + `recent_ops` + `drives`) degrades per sub-list, and is `unavailable` only if all three fail.
-- Malformed individual rows (bad date, non-numeric pct, missing key) are skipped or given `level: warn` — never raise.
-- `import ledger, summarize` failing (repo moved, syntax error upstream) is caught in `storage_status_server.py` and returned as `{ok: false, headline: "The storage status tool couldn't load file-management's code.", sections: {}}`.
-- The MCP tool never raises; any unexpected exception becomes the same `ok: false` shape with a generic headline, and the exception text goes to stderr only (never spoken).
+- Collector failure or timeout → that source unavailable; only its section/sub-list degrades. `ops` is `unavailable` only if `active_ops`, `recent_ops` and `drives` all fail.
+- Malformed individual values (bad date, missing key in a heartbeat) → item `level: warn` or skipped, never raise. Malformed CSV → section unavailable with the `ValueError` text (see Collectors).
+- `snapshot`/`summary` import failure (repo moved, upstream syntax error) → caught by the lazy import inside the tool → `{ok: false, headline: "The storage status tool couldn't load file-management's code.", sections: {}}`. The server process itself still starts and registers the tool.
+- Any other exception → same `ok: false` shape, generic headline; exception text to stderr only.
 
 ## Testing
 
-In `file-management/tests/`, `unittest`, 2-space indent, matching the existing 29-file suite.
+In `file-management/tests/`, `unittest`, 2-space indent, matching the existing suite. Test files do `sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mcp-server"))` to import `summary`/`snapshot` (same approach as 2nd-brain's `tests/test_receipts_status_summary.py:~8`).
 
-1. **`test_storage_status_summary.py`** — pure `build_summary` from fixture snapshots: every threshold edge (84/85/94/95%, 30/31 days), `/System/Volumes` filtering, lane completion, headline ordering and three-item cap, all-healthy, all-unavailable, partially-unavailable, malformed rows.
-2. **`test_storage_status_snapshot.py`** — each collector patched to raise → only its source degrades; a collector patched to `time.sleep(10)` → marked timed out and `collect()` returns in < 7 s.
-3. **No-write guarantee** — run the real `collect()` + `build_summary()` against the real repo; record every file's path + mtime + size under the repo (excluding `__pycache__/` and `.git/`) before and after; assert identical. Also patch `summarize.ops_sweep` and `summarize.main` to raise if called.
+1. **`test_storage_status_summary.py`** — pure `build_summary` from fixture snapshots: threshold edges (84/85/94/95 %, 30/31 days), missing expected mount, lane `open` rule (planned vs executed/reviewed-no-action), supersession (failed + later completed same family → not failed), abandonment (running > 24 h → abandoned; synthetic unreadable → stalled), pinned failure beyond the window still critical, headline order + three-clause cap + reserved last slot, max-age backup phrasing, no slug/path in any headline, all-healthy, all-unavailable, partially-unavailable.
+2. **`test_storage_status_snapshot.py`** — each collector patched to raise → only its source degrades; two collectors patched to `time.sleep(10)` → both marked timed out and `collect()` returns in < 7 s (proves the shared deadline); malformed CSV → section unavailable.
+3. **No-write tripwire** — patch to raise: `summarize.ops_sweep`, `summarize.main`, `summarize.append_ops_log`, `summarize._safe_delete`, `summarize._quarantine_rename_file`, `summarize._atomic_write_relay`, `summarize._acquire_ops_lock`, `ledger.write_rows`, `ops_heartbeat.pick_zone`, `ops_heartbeat.write_heartbeat`, `os.replace`, `Path.unlink`, `Path.mkdir`, `Path.write_text`; run the real `collect()` + `build_summary()`; assert success. Also snapshot path + mtime + size of every file under the repo (excluding only `.git/`), plus `/Volumes/_Inbox/_fleet-drops/_ops` and `…/_heartbeats` when mounted, before and after; assert identical.
 4. **Full existing suite** stays green (`python3 -m unittest discover tests`).
-5. **Live end-to-end through JARVIS** (required before "done", per the receipts-status lesson): register in `~/.claude.json` (stop-and-confirm with Gardiner — full read-modify-write of Claude Code's global state file), restart the bridge, ask "how's my storage?", confirm a spoken headline and a rendered four-section panel.
+5. **Live end-to-end through JARVIS** (required before "done"): register `storage-status` in `~/.claude.json` (stop-and-confirm with Gardiner first — full read-modify-write of Claude Code's global state file), restart the bridge, ask "how's my storage?", confirm the spoken headline and the compact four-row panel, then ask for detail and confirm the blade.
 
 ## Out of scope (log as deferred items in file-management's ledger)
 
-- Loading `com.gabba.fleet-sweep` / choosing the hub — belongs to the Mac Mini session.
-- Any write or action tool (purge, rescan, check-in).
-- Live mirror telemetry from Synology Hyper Backup / Snapshot Replication instead of the hand-kept `mirrors.csv`.
+- Loading `com.gabba.fleet-sweep` / choosing the hub — Mac Mini session.
+- Any write or action tool (purge, rescan, check-in, resolving ops).
+- Live mirror telemetry from Synology Hyper Backup / Snapshot Replication instead of hand-kept `mirrors.csv`.
 - Per-drive SMART reads at call time.
+- Fixing `summarize.volume_fullness()`'s space-in-mount-name parse bug for `STATUS.md`/`fleet_panel` (found by this review; this server sidesteps it via `statvfs`).
+
+## Review log
+
+- **2026-09-24 r1 → r2, fresh-eyes review (Fable subagent, spec + repos only), 19 findings, all accepted.** Blocker: expected output was derived from stale `status.json`, not live collectors. Majors: permanent unresolvable ops alarms (added in-memory supersession/abandonment), `recent[:5]` dropped pinned failures, `df` parse lost space-named mounts (→ `statvfs`), unmounted NAS read as healthy (→ `EXPECTED_MOUNTS` + reserved headline slot), per-collector joins were additive (→ shared deadline), panel exceeded the display tool's row cap (→ compact panel + detail blade), lane `open` definition mismatched real data (ruled: open = has `planned` rows), no-write test too weak (→ tripwire). Minors: stdout guard, bytecode writes, lazy import, test import path, headline phrasings, CSV failure granularity, `reason` contradiction, note splitting, `bytes_done` definition, async tool, server-key `__` constraint.
