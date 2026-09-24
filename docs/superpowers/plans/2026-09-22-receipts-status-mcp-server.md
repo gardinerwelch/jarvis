@@ -353,8 +353,10 @@ mcp-server/.venv/bin/pip install --upgrade pip
 Create `/Users/gardinerwelch/Documents/_Projects/2nd-brain/mcp-server/requirements.txt`:
 
 ```
-mcp>=1.0.0
+mcp>=1.0.0,<2
 ```
+
+(Corrected during implementation, 2026-09-24: an unpinned `mcp>=1.0.0` installs 2.2.0, which renamed `FastMCP` to `MCPServer` and removed `mcp.server.fastmcp` entirely — a hard import failure, not the milder decorator-callability question this plan flagged as the real unknown. Pinning `<2` installs 1.30.0, which matches this task's server code exactly with zero changes needed.)
 
 ```bash
 cd /Users/gardinerwelch/Documents/_Projects/2nd-brain
