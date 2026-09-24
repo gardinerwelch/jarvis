@@ -394,8 +394,17 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("receipts-status")
 
 
+# CORRECTION, 2026-09-24: this plan originally specified `receipts_status()`
+# (no verb prefix) as the tool name. Live testing against the real JARVIS
+# bridge showed that's wrong — bridge/server.mjs's decideTool() auto-approves
+# read-only tools by matching a recognized verb prefix (get/list/read/search/
+# etc.) in the tool name, and a noun-only name silently falls through to
+# requiring ALLOW_WRITES, denying an actually-read-only tool. The tool was
+# renamed to `get_receipts_status()` post-merge (2nd-brain commit 4321ebd).
+# Any future MCP tool built for JARVIS needs a READ_VERB-matching name from
+# the start — see the spec's Components section for the exact regex.
 @mcp.tool()
-def receipts_status() -> dict:
+def get_receipts_status() -> dict:
     """Report the status of the last receipts-ingest pipeline run: whether
     it succeeded, counts (scanned/new/filed/errors), and a spoken-friendly
     summary. Read-only — never triggers a pipeline run."""
