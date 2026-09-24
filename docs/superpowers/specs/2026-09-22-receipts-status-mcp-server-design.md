@@ -57,7 +57,7 @@ JARVIS → MCP tool call (`receipts_status`) → read `status_dir/status.json` f
 
 - `status.json` missing (fresh install, daemon never run) → return `{"summary": "no receipts status recorded yet", "ok": None, "last_run": None, "dry_run": None, "counts": {}}`, not an exception.
 - `status.json` unreadable / malformed JSON → same fallback shape, never a stack trace surfaced as spoken output.
-- `status["ok"] is False` → `build_summary()` leads with the daemon's own `error` field instead of the counts.
+- `status["ok"] is False` → `build_summary()` leads with the daemon's own `error` field instead of the counts. **Correction, 2026-09-24:** commit `41bf6d1` (merged to `2nd-brain` main 2026-09-23, after this spec locked) changed `ok` from hardcoded `true` to `counts["errors"] == 0` — a message-level failure now produces `ok: false` with *no* `error` key at all (only setup-level `_fail()` statuses carry one). `run.py`'s own `main()` already falls back to `"{errors} of {new} message(s) errored"` in that case; `build_summary()` must do the same instead of a generic "no error message recorded" string, to stay consistent with the pipeline's own logging and actually say something useful.
 - `last_run` older than 24 hours → staleness warning prefix (see Components), even when `ok` is `True`.
 
 ## Testing

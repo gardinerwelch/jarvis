@@ -19,6 +19,7 @@
 - **Vendor tally must use `.get("vendor")`, never `result["vendor"]`** — per-message-exception result dicts from `run_once()` (run.py) have no `vendor` key (spec: Components).
 - **Staleness threshold: 24 hours.** If `last_run` is older than that, the summary must lead with a plain staleness warning rather than reporting the counts as current (spec: Error handling).
 - **Return shape:** `{"summary": str, "ok": bool | None, "last_run": str | None, "dry_run": bool | None, "counts": dict}`. `ok`/`last_run`/`dry_run` are `None` and `counts` is `{}` on the missing-file and malformed-JSON paths (spec: Components).
+- **Ok:false fallback matches `run.py`'s own logging exactly.** `"{errors} of {new} message(s) errored"` when there's no `error` key — added 2026-09-24 after discovering commit `41bf6d1` changed `ok` from hardcoded `true` to derived, post-dating the original spec lock (spec: Error handling correction; ledger: Ruling 1).
 
 ---
 
@@ -82,6 +83,19 @@ class TestBuildSummary(unittest.TestCase):
         summary = build_summary(status, now=FIXED_NOW)
         self.assertIn("GmailClient auth failed", summary)
 
+    def test_failed_run_without_error_key_falls_back_to_counts(self):
+        # As of 2nd-brain commit 41bf6d1 (2026-09-23), `ok` is derived from
+        # counts["errors"] == 0 — a message-level failure produces ok: false
+        # with NO "error" key. run.py's own main() falls back to "{errors}
+        # of {new} message(s) errored"; build_summary must match it exactly.
+        status = {
+            "last_run": "2026-09-22T11:40:00Z", "ok": False, "dry_run": True,
+            "counts": {"scanned": 14, "new": 14, "filed": 7, "errors": 7},
+            "results": [],
+        }
+        summary = build_summary(status, now=FIXED_NOW)
+        self.assertIn("7 of 14 message(s) errored", summary)
+
     def test_result_without_vendor_key_does_not_raise(self):
         status = {
             "last_run": "2026-09-22T11:40:00Z", "ok": True, "dry_run": True,
@@ -144,7 +158,13 @@ def build_summary(status, now=None):
     now = now or datetime.now(timezone.utc)
 
     if status.get("ok") is False:
-        return status.get("error") or "the last run failed with no error message recorded"
+        # Matches run.py's own main() fallback exactly (as of commit 41bf6d1,
+        # 2026-09-23): a message-level failure carries no "error" key, only
+        # counts — so fall back to the same "{errors} of {new} message(s)
+        # errored" wording the pipeline's own log line already uses.
+        fail_counts = status.get("counts") or {}
+        return status.get("error") or "{} of {} message(s) errored".format(
+            fail_counts.get("errors", "?"), fail_counts.get("new", "?"))
 
     counts = status.get("counts") or {}
     results = status.get("results") or []
