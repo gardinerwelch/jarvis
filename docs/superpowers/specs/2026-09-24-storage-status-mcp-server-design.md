@@ -1,6 +1,6 @@
 # Storage Status MCP Server — Design
 
-**Status:** DRAFT r4 — three fresh-eyes reviews (2026-09-24: 19 + 13 + 12 findings) plus a targeted re-read (2 minors, fixed) ruled and folded in; reviewer verdict: ready to lock. Pending Gardiner's approval.
+**Status:** LOCKED 2026-09-24 (r4) — three fresh-eyes reviews (19 + 13 + 12 findings) plus a targeted re-read (2 minors, fixed), all ruled and folded in; approved by Gardiner. Any further edit re-triggers a fresh-eyes review (Gate 5).
 **Date:** 2026-09-24
 **Repo this builds in:** `file-management` (not `jarvis`). This doc lives in `jarvis` alongside the receipts-status spec because it records the second instance of the JARVIS MCP-server-per-repo pattern; the code lives next to the data it reads.
 **Predecessor:** `2026-09-22-receipts-status-mcp-server-design.md` (same pattern, first instance)
