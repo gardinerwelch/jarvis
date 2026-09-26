@@ -99,6 +99,19 @@ const STOP_WORD =
   /^(?:stop|cancel|wait|hold on|enough|quiet|shut up|never ?mind|forget it)(?:\s+(?:that|it|there|now|please))?[\s,.!?]*$/i
 const BUSY = new Set(['thinking', 'tooling', 'speaking'])
 
+/** "Good afternoon. Friday, September 26th. Online and ready." Spoken, so the
+ *  day gets its ordinal — "26th" reads naturally where "26" sounds clipped. */
+function startupLine(now: Date): string {
+  const hour = now.getHours()
+  const part = hour < 12 ? 'morning' : hour < 17 ? 'afternoon' : 'evening'
+  const day = now.getDate()
+  const teen = day % 100 >= 11 && day % 100 <= 13
+  const suffix = teen ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' } as Record<number, string>)[day % 10] ?? 'th'
+  const weekday = now.toLocaleDateString('en-US', { weekday: 'long' })
+  const month = now.toLocaleDateString('en-US', { month: 'long' })
+  return `Good ${part}. ${weekday}, ${month} ${day}${suffix}. Online and ready.`
+}
+
 export default function App() {
   const store = useStore
   const phase = useStore((s) => s.phase)
@@ -456,7 +469,9 @@ export default function App() {
 
   // -- power on -------------------------------------------------------------
 
-  const powerOn = async (skip = false) => {
+  // Clap, Space and INITIALISE all land here with no argument: a fast start,
+  // straight to work. The full boot is only ever an explicit request.
+  const powerOn = async (skip = true) => {
     // The ignition button and the space bar can both land here, and the phase
     // only moves after the first await — so without this a double press boots
     // twice, arming two voice loops and two download polls.
@@ -491,14 +506,13 @@ export default function App() {
     // Must happen inside the click handler — browsers won't start an
     // AudioContext or speech synthesis without a user gesture.
     await sfx.unlockAudio()
-    // Skipping the boot skips its cue and its score too: the rising boot track
-    // over an interface that is already up reads as a glitch.
+    // Skipping the boot skips its cue too: a start-up sound over an interface
+    // that is already up reads as a glitch.
     if (!skip) sfx.play('boot')
-    // The score. Must be started from inside this click handler for the same
-    // reason as the rest of the audio.
-    music.enable()
-    if (!skip) music.playBoot()
-    music.startAmbient()
+    // No music, by choice: the boot track (it carries the spoken intro), the
+    // ambient bed and the work cue all stay silent. music.enable() is the one
+    // switch — every cue is a no-op until it is called — so restoring the score
+    // is a single line here, followed by playBoot()/startAmbient() for the show.
 
     s.setPhase('boot')
 
@@ -682,6 +696,22 @@ export default function App() {
     setMicMuted(store.getState().muted)
 
     store.getState().setPhase('dormant')
+    greetOnline()
+  }
+
+  /**
+   * One line to say he is up. Local and instant on purpose: a daily summary
+   * here would mean tool calls, and the slowest of those (a cold NAS read) is
+   * exactly the wait a fast start exists to remove. Kept in one place so an
+   * embedded start can shorten or drop it later.
+   */
+  const greetOnline = () => {
+    const line = startupLine(new Date())
+    const spk = createSpeaker()
+    speaker.current = spk
+    store.getState().setCaption(line)
+    spk.say(line)
+    void spk.end()
   }
 
   // -- clap to start --------------------------------------------------------
@@ -900,7 +930,7 @@ export default function App() {
       <Diagnostics />
       <Ignition
         onStart={() => void powerOn()}
-        onSkip={() => void powerOn(true)}
+        onPlayBoot={() => void powerOn(false)}
       />
     </>
   )

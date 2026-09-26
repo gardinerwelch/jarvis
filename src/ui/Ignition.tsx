@@ -35,10 +35,10 @@ import { useStore } from '../store'
  */
 export function Ignition({
   onStart,
-  onSkip,
+  onPlayBoot,
 }: {
   onStart: () => void
-  onSkip: () => void
+  onPlayBoot: () => void
 }) {
   const phase = useStore((s) => s.phase)
   if (phase !== 'offline') return null
@@ -61,9 +61,10 @@ export function Ignition({
     {/* A sibling, not a child: a button inside a button is invalid markup, and
         the browser would hoist it out anyway. Sits above the full-frame
         ignition button so it takes its own clicks. It unmounts with the
-        ignition screen, under the same plain conditional. */}
-    <button className="ignition-skip" onClick={onSkip}>
-      Skip boot up
+        ignition screen, under the same plain conditional. Power-up is a fast
+        start by default, so this is the way back to the full show. */}
+    <button className="ignition-skip" onClick={onPlayBoot}>
+      Play boot sequence
     </button>
     </>
   )

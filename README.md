@@ -285,10 +285,19 @@ concentric reticle rings resolving into "J.A.R.V.I.S"; then a suit schematic;
 then the triangular arc reactor lighting up — with a start-up sound under it
 (`public/audio/boot-music.mp3`).
 
-Don't want to sit through it? Click **SKIP BOOT UP** under INITIALISE on the
-start screen. It skips the animation, the boot cue and the wait, and brings the
-live interface straight up in the same theme. A click is still needed either
-way, because browsers will not play audio before one.
+It only plays when asked for. INITIALISE (or a clap, or Space) does a fast
+start: no animation, no boot cue, straight to the live interface. Click
+**PLAY BOOT SEQUENCE** under INITIALISE when you want the show. A click is
+still needed either way, because browsers will not play audio before one.
+
+Music is off: the boot track (with its spoken intro), the ambient bed and the
+work cue never play, even on a replay. `src/lib/music.ts` and the files in
+`public/audio/` are kept; calling `music.enable()` in `ignite` in
+`src/App.tsx` brings them back.
+
+Either way, once he is live he says one line: the time of day, the date, and
+"Online and ready." It is built locally with no tool calls, so it costs nothing
+and never waits on the network.
 
 ---
 
